@@ -3,18 +3,24 @@
 Invariants enforced inside every ``BEGIN IMMEDIATE`` SQLite transaction:
 
 * Occupied CPU on a node = CPU of ``serving`` containers placed there +
-  CPU reserved by ``starting`` new replicas targeting that node. The old
-  replica keeps serving while its replacement starts, so both are counted.
+  CPU reserved by ``starting`` / ``awaiting_cutover`` new replicas targeting
+  that node. The old replica keeps serving while its replacement starts, so
+  both are counted.
 * A drain reserves capacity on a target *before* any replica is promoted, and
   the old replica is only removed in the same transaction that promotes the
   new replica. A service's ready count therefore never dips below
   ``min_ready``.
+* A replica that is processing a long business request is never stopped
+  mid-request: when its replacement becomes ready the migration parks in
+  ``awaiting_cutover`` (target CPU stays reserved) and the cutover fires
+  exactly once, inside the transaction that marks the request completed.
 * If there is no viable target, or the simulated start fails, the reservation
   is released and the old replica keeps serving; the container is reported as
   blocked.
 * Every mutation re-reads state under the write lock, so concurrent drains
   cannot double-book capacity. Nothing is rebuilt in memory at startup: an
-  interrupted drain resumes from the persisted SQLite state.
+  interrupted drain (including a parked cutover) resumes from the persisted
+  SQLite state.
 """
 
 from __future__ import annotations
@@ -27,8 +33,11 @@ from .db import Database
 from .schemas import TopologyIn
 
 OPEN_DRAIN_STATUSES = ("active", "incomplete")
+# Migration states that still hold the target-node CPU reservation.
+OPEN_MIGRATION_STATES = ("starting", "awaiting_cutover")
 BLOCKED_STATES = ("failed", "blocked")
 MAX_HISTORY_DRAINS = 12
+MAX_REQUESTS_IN_SNAPSHOT = 100
 
 
 class ApiError(Exception):
@@ -70,9 +79,31 @@ def _serving_containers(
     ).fetchall()
 
 
+def _open_migrations(
+    conn: sqlite3.Connection, target_node_id: str | None = None
+) -> list[sqlite3.Row]:
+    """Reserved (starting or parked) migrations, optionally on one target."""
+    placeholders = ",".join("?" for _ in OPEN_MIGRATION_STATES)
+    if target_node_id is None:
+        return conn.execute(
+            f"SELECT * FROM migrations WHERE state IN ({placeholders}) ORDER BY id",
+            OPEN_MIGRATION_STATES,
+        ).fetchall()
+    return conn.execute(
+        f"SELECT * FROM migrations WHERE state IN ({placeholders}) "
+        "AND target_node_id = ? ORDER BY id",
+        (*OPEN_MIGRATION_STATES, target_node_id),
+    ).fetchall()
+
+
 def _starting_migrations(
     conn: sqlite3.Connection, target_node_id: str | None = None
 ) -> list[sqlite3.Row]:
+    """Migrations still waiting for the new replica to become ready.
+
+    A parked ``awaiting_cutover`` migration is no longer in this set, but it
+    still counts as an inbound reservation via :func:`_open_migrations`.
+    """
     if target_node_id is None:
         return conn.execute(
             "SELECT * FROM migrations WHERE state = 'starting' ORDER BY id"
@@ -86,6 +117,7 @@ def _starting_migrations(
 
 def _usage(conn: sqlite3.Connection) -> dict[str, dict[str, int]]:
     """CPU accounting per node: serving requests plus in-flight reservations."""
+    placeholders = ",".join("?" for _ in OPEN_MIGRATION_STATES)
     usage: dict[str, dict[str, int]] = {
         node["id"]: {"serving": 0, "reserved": 0} for node in _node_rows(conn)
     }
@@ -97,9 +129,10 @@ def _usage(conn: sqlite3.Connection) -> dict[str, dict[str, int]]:
             "serving"
         ] = row["total"]
     for row in conn.execute(
-        "SELECT target_node_id, SUM(reserved_cpu) AS total FROM migrations "
-        "WHERE state = 'starting' AND target_node_id IS NOT NULL "
-        "GROUP BY target_node_id"
+        f"SELECT target_node_id, SUM(reserved_cpu) AS total FROM migrations "
+        f"WHERE state IN ({placeholders}) AND target_node_id IS NOT NULL "
+        "GROUP BY target_node_id",
+        OPEN_MIGRATION_STATES,
     ).fetchall():
         usage.setdefault(row["target_node_id"], {"serving": 0, "reserved": 0})[
             "reserved"
@@ -148,10 +181,17 @@ def _latest_attempts(
 
 
 def _pending_migrations(conn: sqlite3.Connection) -> dict[str, sqlite3.Row]:
+    """Every unresolved migration keyed by container id.
+
+    Includes parked ``awaiting_cutover`` rows: the container still has an
+    in-flight move even though its replica is not accepting new requests.
+    """
+    placeholders = ",".join("?" for _ in OPEN_MIGRATION_STATES)
     return {
         row["container_id"]: row
         for row in conn.execute(
-            "SELECT * FROM migrations WHERE state = 'starting' ORDER BY id"
+            f"SELECT * FROM migrations WHERE state IN ({placeholders}) ORDER BY id",
+            OPEN_MIGRATION_STATES,
         ).fetchall()
     }
 
@@ -210,7 +250,8 @@ def _drain_public(
         # History is frozen at completion; later drains moving replicas back
         # must not rewrite an old drain's result.
         moved = total
-    pending = [row for row in attempts if row["state"] == "starting"]
+    starting = [row for row in attempts if row["state"] == "starting"]
+    parked = [row for row in attempts if row["state"] == "awaiting_cutover"]
     failed = [row for row in latest.values() if row["state"] == "failed"]
     blocked = [row for row in latest.values() if row["state"] == "blocked"]
 
@@ -224,11 +265,13 @@ def _drain_public(
         "total": total,
         "moved": moved,
         "remaining_on_node": len(serving),
-        "starting": len(pending),
+        "starting": len(starting),
+        "awaiting_cutover": len(parked),
         "failed": len(failed),
         "blocked": len(blocked),
         "progress_percent": round((moved / total) * 100, 1) if total else 100.0,
-        "pending_decisions": [_public_migration(row) for row in pending],
+        "pending_decisions": [_public_migration(row) for row in starting],
+        "awaiting_cutover_migrations": [_public_migration(row) for row in parked],
         "attempts": [_public_migration(row) for row in attempts],
     }
 
@@ -250,6 +293,10 @@ def snapshot(db: Database) -> dict[str, Any]:
             for drain in open_drains
         }
         pending = _pending_migrations(conn)
+        starting_only = {
+            row["container_id"]: row
+            for row in _starting_migrations(conn)
+        }
 
         ready_by_service: dict[str, int] = {}
         for container in containers:
@@ -257,6 +304,30 @@ def snapshot(db: Database) -> dict[str, Any]:
                 ready_by_service[container["service"]] = (
                     ready_by_service.get(container["service"], 0) + 1
                 )
+
+        # Long business requests drive cutover deferral and the "one request
+        # per replica" admission rule.
+        running_requests = conn.execute(
+            "SELECT * FROM requests WHERE status = 'running' ORDER BY id"
+        ).fetchall()
+        running_by_container: dict[str, sqlite3.Row] = {
+            row["container_id"]: row for row in running_requests
+        }
+        running_by_node: dict[str, int] = {}
+        for row in running_requests:
+            if row["node_id"] is not None:
+                running_by_node[row["node_id"]] = (
+                    running_by_node.get(row["node_id"], 0) + 1
+                )
+        running_by_service: dict[str, int] = {}
+        for row in running_requests:
+            running_by_service[row["service"]] = (
+                running_by_service.get(row["service"], 0) + 1
+            )
+        recent_requests = conn.execute(
+            "SELECT * FROM requests ORDER BY id DESC LIMIT ?",
+            (MAX_REQUESTS_IN_SNAPSHOT,),
+        ).fetchall()
 
         blocked_containers: list[dict[str, Any]] = []
         for drain in open_drains:
@@ -288,13 +359,18 @@ def snapshot(db: Database) -> dict[str, Any]:
         for node in nodes:
             row = usage.get(node["id"], {"serving": 0, "reserved": 0})
             drain = open_by_node.get(node["id"])
-            inbound = _starting_migrations(conn, node["id"])
+            # Inbound reservations include both starting replicas and replicas
+            # parked in awaiting_cutover: both still hold target CPU.
+            inbound = _open_migrations(conn, node["id"])
             serving_here = [
                 container
                 for container in containers
                 if container["node_id"] == node["id"]
                 and container["status"] == "serving"
             ]
+            busy_here = sum(1 for c in serving_here if c["id"] in running_by_container)
+            accept_here = sum(1 for c in serving_here if c["id"] not in running_by_container
+                              and c["id"] not in pending)
             last_completed = conn.execute(
                 "SELECT * FROM drains WHERE node_id = ? AND status = 'completed' "
                 "ORDER BY id DESC LIMIT 1",
@@ -313,12 +389,15 @@ def snapshot(db: Database) -> dict[str, Any]:
                     ),
                     "status": node["status"],
                     "serving_containers": len(serving_here),
+                    "running_requests": running_by_node.get(node["id"], 0),
+                    "available_replicas": accept_here,
                     "inbound_reservations": [
                         {
                             "migration_id": item["id"],
                             "container_id": item["container_id"],
                             "cpu": item["reserved_cpu"],
                             "drain_id": item["drain_id"],
+                            "state": item["state"],
                         }
                         for item in inbound
                     ],
@@ -368,6 +447,7 @@ def snapshot(db: Database) -> dict[str, Any]:
                     BLOCKED_STATES
                 ):
                     last_attempt = None
+            active_request = running_by_container.get(container["id"])
             container_payload.append(
                 {
                     "id": container["id"],
@@ -386,16 +466,33 @@ def snapshot(db: Database) -> dict[str, Any]:
                         if last_attempt is not None
                         else None
                     ),
+                    "active_request": (
+                        _public_request(active_request)
+                        if active_request is not None
+                        else None
+                    ),
+                    "accepting_requests": (
+                        container["id"] not in running_by_container
+                        and container["id"] not in pending
+                    ),
                 }
             )
 
         service_payload: list[dict[str, Any]] = []
         for service in services:
             ready = ready_by_service.get(service["name"], 0)
+            # Only replicas still waiting to start count as "starting"; parked
+            # replicas are already ready but their cutover is deferred.
             starting = sum(
                 1
-                for container_id in pending
+                for container_id in starting_only
                 if container_lookup[container_id]["service"] == service["name"]
+            )
+            awaiting = sum(
+                1
+                for container_id, row in pending.items()
+                if row["state"] == "awaiting_cutover"
+                and container_lookup[container_id]["service"] == service["name"]
             )
             defined = sum(
                 1 for container in containers if container["service"] == service["name"]
@@ -407,6 +504,8 @@ def snapshot(db: Database) -> dict[str, Any]:
                     "ready": ready,
                     "defined": defined,
                     "starting_replicas": starting,
+                    "awaiting_cutover_replicas": awaiting,
+                    "running_requests": running_by_service.get(service["name"], 0),
                     "healthy": ready >= service["min_ready"],
                 }
             )
@@ -427,6 +526,8 @@ def snapshot(db: Database) -> dict[str, Any]:
                 or _drain_public(conn, drain)
                 for drain in history
             ],
+            "requests": [_public_request(row) for row in recent_requests],
+            "running_request_count": len(running_requests),
             "unfinished_drain_count": sum(
                 1 for drain in open_drains if drain["status"] == "incomplete"
             ),
@@ -435,6 +536,21 @@ def snapshot(db: Database) -> dict[str, Any]:
             ),
             "limits": {"max_nodes": 4, "max_containers": 8},
         }
+
+
+def _public_request(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "service": row["service"],
+        "container_id": row["container_id"],
+        "node_id": row["node_id"],
+        "status": row["status"],
+        "note": row["note"],
+        "result": row["result"],
+        "cutover_migration_id": row["cutover_migration_id"],
+        "created_at": row["created_at"],
+        "completed_at": row["completed_at"],
+    }
 
 
 def _public_drain_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -458,9 +574,14 @@ def _finalize_drain(conn: sqlite3.Connection, drain_id: int) -> None:
     if drain is None or drain["status"] not in OPEN_DRAIN_STATUSES:
         return
     node_id = drain["node_id"]
+    # Both starting and parked (awaiting cutover) migrations keep the drain
+    # open: parked replicas still hold a reservation and an old replica that is
+    # processing a request.
+    placeholders = ",".join("?" for _ in OPEN_MIGRATION_STATES)
     pending = conn.execute(
-        "SELECT COUNT(*) AS n FROM migrations WHERE drain_id = ? AND state = 'starting'",
-        (drain_id,),
+        f"SELECT COUNT(*) AS n FROM migrations "
+        f"WHERE drain_id = ? AND state IN ({placeholders})",
+        (drain_id, *OPEN_MIGRATION_STATES),
     ).fetchone()["n"]
     serving = conn.execute(
         "SELECT COUNT(*) AS n FROM containers WHERE node_id = ? AND status = 'serving'",
@@ -484,9 +605,9 @@ def _finalize_drain(conn: sqlite3.Connection, drain_id: int) -> None:
         # Only report the node empty when nothing serves there and nothing is
         # reserved against it.
         reservations = conn.execute(
-            "SELECT COUNT(*) AS n FROM migrations "
-            "WHERE state = 'starting' AND target_node_id = ?",
-            (node_id,),
+            f"SELECT COUNT(*) AS n FROM migrations "
+            f"WHERE state IN ({placeholders}) AND target_node_id = ?",
+            (*OPEN_MIGRATION_STATES, node_id),
         ).fetchone()["n"]
         if serving == 0 and reservations == 0:
             conn.execute(
@@ -539,7 +660,8 @@ def reconcile(db: Database) -> None:
 def import_topology(db: Database, topology: TopologyIn) -> dict[str, Any]:
     """Replace the entire simulation state atomically."""
     with db.write() as conn:
-        # Children before parents (containers/drains reference nodes).
+        # Children before parents (requests/containers/drains reference nodes).
+        conn.execute("DELETE FROM requests")
         conn.execute("DELETE FROM migrations")
         conn.execute("DELETE FROM drains")
         conn.execute("DELETE FROM containers")
@@ -586,6 +708,7 @@ def import_topology(db: Database, topology: TopologyIn) -> dict[str, Any]:
 
 def reset(db: Database) -> dict[str, Any]:
     with db.write() as conn:
+        conn.execute("DELETE FROM requests")
         conn.execute("DELETE FROM migrations")
         conn.execute("DELETE FROM drains")
         conn.execute("DELETE FROM containers")
@@ -672,12 +795,15 @@ def _schedule(conn: sqlite3.Connection, drain_id: int, node_id: str) -> None:
         key=lambda c: (-surplus(c), -c["cpu_request"], c["position"], c["id"]),
     )
     for container in containers:
+        placeholders = ",".join("?" for _ in OPEN_MIGRATION_STATES)
         if conn.execute(
-            "SELECT 1 FROM migrations WHERE container_id = ? AND state = 'starting'",
-            (container["id"],),
+            f"SELECT 1 FROM migrations WHERE container_id = ? "
+            f"AND state IN ({placeholders})",
+            (container["id"], *OPEN_MIGRATION_STATES),
         ).fetchone():
-            # A replica is already starting for this container; its cutover
-            # will free the source slot when resolved.
+            # A move for this container is already unresolved: either the new
+            # replica is still starting, or it is parked waiting for the old
+            # replica's in-flight request to finish before cutover.
             continue
 
         candidates = _candidate_targets(conn, node_id)
@@ -755,7 +881,7 @@ def start_drain(db: Database, node_id: str) -> dict[str, Any]:
             raise ApiError(
                 409, "NODE_ALREADY_DRAINED", f"node {node_id!r} is already drained"
             )
-        inbound = _starting_migrations(conn, node_id)
+        inbound = _open_migrations(conn, node_id)
         if inbound:
             raise ApiError(
                 409,
@@ -792,16 +918,18 @@ def resume_drain(db: Database, node_id: str) -> dict[str, Any]:
                 "DRAIN_ALREADY_ACTIVE",
                 "the drain is still active; resolve pending replicas first",
             )
+        placeholders = ",".join("?" for _ in OPEN_MIGRATION_STATES)
         pending = conn.execute(
-            "SELECT COUNT(*) AS n FROM migrations "
-            "WHERE drain_id = ? AND state = 'starting'",
-            (drain["id"],),
+            f"SELECT COUNT(*) AS n FROM migrations "
+            f"WHERE drain_id = ? AND state IN ({placeholders})",
+            (drain["id"], *OPEN_MIGRATION_STATES),
         ).fetchone()["n"]
         if pending:
             raise ApiError(
                 409,
                 "PENDING_REPLICAS",
-                "new replicas are still starting; mark them ready or failed first",
+                "new replicas are still starting or waiting for cutover; "
+                "resolve them first",
             )
 
         conn.execute(
@@ -849,10 +977,34 @@ def restore_node(db: Database, node_id: str) -> dict[str, Any]:
     return snapshot(db)
 
 
+def _promote_replica(
+    conn: sqlite3.Connection,
+    *,
+    migration_id: int,
+    target_id: str,
+    container_id: str,
+) -> None:
+    """Atomic cutover: promote the new replica and stop the old one."""
+    conn.execute(
+        "UPDATE containers SET node_id = ? WHERE id = ?",
+        (target_id, container_id),
+    )
+    conn.execute(
+        "UPDATE migrations SET state = 'completed', updated_at = ? WHERE id = ?",
+        (utcnow(), migration_id),
+    )
+
+
 def resolve_migration(
     db: Database, migration_id: int, outcome: str, reason: str | None
 ) -> dict[str, Any]:
-    """Simulate the new replica becoming ready (cutover) or failing to start."""
+    """Simulate the new replica becoming ready (or failing to start).
+
+    On ``ready`` the cutover is immediate only when the old replica is idle.
+    If it is still processing a long request the migration parks in
+    ``awaiting_cutover`` without changing drain progress or the service's
+    ready count; the request-completion command performs the single cutover.
+    """
     with db.write() as conn:
         migration = conn.execute(
             "SELECT * FROM migrations WHERE id = ?", (migration_id,)
@@ -908,19 +1060,33 @@ def resolve_migration(
                     (reason or "target reservation is no longer valid", utcnow(), migration_id),
                 )
             else:
-                # Atomic cutover: the new replica takes the reserved capacity
-                # and the old replica stops in the same transaction.
-                conn.execute(
-                    "UPDATE containers SET node_id = ? WHERE id = ?",
-                    (target_id, container["id"]),
-                )
-                conn.execute(
-                    "UPDATE migrations SET state = 'completed', updated_at = ? "
-                    "WHERE id = ?",
-                    (utcnow(), migration_id),
-                )
+                active_request = conn.execute(
+                    "SELECT * FROM requests WHERE container_id = ? AND status = 'running' "
+                    "ORDER BY id LIMIT 1",
+                    (container["id"],),
+                ).fetchone()
+                if active_request is not None:
+                    # The old replica is mid-request: keep both replicas and the
+                    # target reservation, park the move and wait for the request
+                    # to complete. Nothing about progress or ready counts moves
+                    # yet, and the old replica does not stop.
+                    conn.execute(
+                        "UPDATE migrations SET state = 'awaiting_cutover', "
+                        "updated_at = ? WHERE id = ?",
+                        (utcnow(), migration_id),
+                    )
+                else:
+                    # Atomic cutover: the new replica takes the reserved
+                    # capacity and the old replica stops in the same transaction.
+                    _promote_replica(
+                        conn,
+                        migration_id=migration_id,
+                        target_id=target_id,
+                        container_id=container["id"],
+                    )
         else:
-            # Failure releases the reservation; the old replica never stopped.
+            # Failure releases the reservation; the old replica never stopped,
+            # and any request it was processing can still finish there.
             conn.execute(
                 "UPDATE migrations SET state = 'failed', "
                 "error_code = 'REPLICA_START_FAILED', error = ?, updated_at = ? "
@@ -929,4 +1095,174 @@ def resolve_migration(
             )
 
         _finalize_drain(conn, migration["drain_id"])
+    return snapshot(db)
+
+
+# --------------------------------------------------------------------------- #
+# Simulated long-running business requests
+# --------------------------------------------------------------------------- #
+
+# Rejection reason codes, in reporting priority.
+REJECTION_PRIORITY = (
+    "NO_REPLICA",
+    "SERVICE_DRAINING",
+    "REPLICA_BUSY",
+    "REPLICA_PARKED",
+    "REPLICA_STARTING",
+)
+REJECTION_MESSAGES = {
+    "NO_REPLICA": "业务没有任何在服副本",
+    "SERVICE_DRAINING": "节点排空中的旧副本不接新请求",
+    "REPLICA_STARTING": "副本的新副本启动中，暂不接新请求",
+    "REPLICA_PARKED": "副本等待请求结束后切换，不接新请求",
+    "REPLICA_BUSY": "每个副本同时最多处理一笔，副本正忙",
+}
+
+
+def _rejection_reason(
+    *,
+    node: sqlite3.Row,
+    open_migration: sqlite3.Row | None,
+    busy: bool,
+) -> str:
+    if node["status"] != "ready":
+        return "SERVICE_DRAINING"
+    if open_migration is not None:
+        if open_migration["state"] == "awaiting_cutover":
+            return "REPLICA_PARKED"
+        return "REPLICA_STARTING"
+    if busy:
+        return "REPLICA_BUSY"
+    return "SERVICE_DRAINING"
+
+
+def submit_request(db: Database, service_name: str) -> dict[str, Any]:
+    """Place a simulated long-running request on one replica of ``service_name``.
+
+    Admission rules, all evaluated inside the write lock:
+
+    * the replica must be ``serving`` on a ``ready`` node (draining nodes' old
+      replicas and parked/starting replicas do not take new work);
+    * each replica processes at most one running request at a time.
+
+    When nothing can accept the request it is still persisted as ``rejected``
+    so the dashboard can show the explicit refusal.
+    """
+    with db.write() as conn:
+        if conn.execute(
+            "SELECT 1 FROM services WHERE name = ?", (service_name,)
+        ).fetchone() is None:
+            raise ApiError(
+                404, "SERVICE_NOT_FOUND", f"service {service_name!r} does not exist"
+            )
+
+        replicas = conn.execute(
+            "SELECT * FROM containers WHERE service = ? AND status = 'serving' "
+            "ORDER BY position, id",
+            (service_name,),
+        ).fetchall()
+        open_migrations = _pending_migrations(conn)
+        running = {
+            row["container_id"]: row
+            for row in conn.execute(
+                "SELECT * FROM requests WHERE status = 'running'"
+            ).fetchall()
+        }
+        node_lookup = {row["id"]: row for row in _node_rows(conn)}
+
+        chosen: sqlite3.Row | None = None
+        reason_codes: list[str] = []
+        for replica in replicas:
+            node = node_lookup[replica["node_id"]]
+            migration = open_migrations.get(replica["id"])
+            busy = replica["id"] in running
+            eligible = node["status"] == "ready" and migration is None and not busy
+            if eligible:
+                chosen = replica
+                break
+            reason_codes.append(
+                _rejection_reason(
+                    node=node, open_migration=migration, busy=busy
+                )
+            )
+
+        now = utcnow()
+        if chosen is None:
+            code = "NO_REPLICA"
+            if reason_codes:
+                # Report the most informative reason across all replicas.
+                code = next(c for c in REJECTION_PRIORITY if c in reason_codes)
+            message = REJECTION_MESSAGES[code]
+            conn.execute(
+                "INSERT INTO requests "
+                "(service, container_id, node_id, status, note, result, "
+                "cutover_migration_id, created_at, completed_at) "
+                "VALUES (?, NULL, NULL, 'rejected', ?, NULL, NULL, ?, ?)",
+                (service_name, f"{code}: {message}", now, now),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO requests "
+                "(service, container_id, node_id, status, note, result, "
+                "cutover_migration_id, created_at, completed_at) "
+                "VALUES (?, ?, ?, 'running', NULL, NULL, NULL, ?, NULL)",
+                (service_name, chosen["id"], chosen["node_id"], now),
+            )
+    return snapshot(db)
+
+
+def complete_request(db: Database, request_id: int, result: str | None) -> dict[str, Any]:
+    """Finish a simulated request, firing the deferred cutover if one is parked.
+
+    The request update and the cutover share one transaction, so the move
+    happens exactly once even when completion and readiness interleave across
+    requests/instances: the parked migration's state is the guard.
+    """
+    with db.write() as conn:
+        request = conn.execute(
+            "SELECT * FROM requests WHERE id = ?", (request_id,)
+        ).fetchone()
+        if request is None:
+            raise ApiError(
+                404, "REQUEST_NOT_FOUND", f"request {request_id} does not exist"
+            )
+        if request["status"] != "running":
+            raise ApiError(
+                409,
+                "REQUEST_NOT_RUNNING",
+                f"request {request_id} is {request['status']!r}, not running",
+            )
+
+        cutover_migration_id: int | None = None
+        container_id = request["container_id"]
+        if container_id is not None:
+            parked = conn.execute(
+                "SELECT * FROM migrations WHERE container_id = ? "
+                "AND state = 'awaiting_cutover' ORDER BY id LIMIT 1",
+                (container_id,),
+            ).fetchone()
+            if parked is not None:
+                # The new replica has been ready since the migration parked;
+                # promoting it now stops the old replica only after its request
+                # has finished.
+                _promote_replica(
+                    conn,
+                    migration_id=parked["id"],
+                    target_id=parked["target_node_id"],
+                    container_id=container_id,
+                )
+                cutover_migration_id = parked["id"]
+                _finalize_drain(conn, parked["drain_id"])
+
+        now = utcnow()
+        conn.execute(
+            "UPDATE requests SET status = 'completed', result = ?, "
+            "cutover_migration_id = ?, completed_at = ? WHERE id = ?",
+            (
+                result or "请求已完成",
+                cutover_migration_id,
+                now,
+                request_id,
+            ),
+        )
     return snapshot(db)

@@ -73,10 +73,10 @@
         </div>
         <table class="mini-table">
           <thead>
-            <tr><th>业务</th><th>就绪/最小</th><th>启动中</th><th>状态</th></tr>
+            <tr><th>业务</th><th>就绪/最小</th><th>启动中</th><th>待切换</th><th>在途请求</th><th>状态</th></tr>
           </thead>
           <tbody id="service-body">
-            <tr><td colspan="4" class="empty">暂无数据</td></tr>
+            <tr><td colspan="6" class="empty">暂无数据</td></tr>
           </tbody>
         </table>
       </section>
@@ -90,6 +90,21 @@
         </div>
         <div id="drain-body">
           <p class="empty">尚未选择排空任务。</p>
+        </div>
+      </section>
+
+      <section class="panel" id="request-panel">
+        <div class="panel-head">
+          <h2>模拟业务请求（长请求演练）</h2>
+          <span class="hint">每个副本同时最多处理一笔</span>
+        </div>
+        <div class="row gap" style="flex-wrap:wrap">
+          <select id="request-service" class="request-select" aria-label="选择业务"></select>
+          <button class="btn" id="request-submit">发起模拟请求</button>
+          <span class="hint" id="request-hint"></span>
+        </div>
+        <div id="request-body" style="margin-top:12px">
+          <p class="empty">尚未发起模拟请求。</p>
         </div>
       </section>
 
@@ -111,11 +126,11 @@
             <thead>
               <tr>
                 <th>容器</th><th>业务</th><th>CPU 请求</th><th>所在节点</th>
-                <th>状态</th><th>迁移</th>
+                <th>状态</th><th>请求</th><th>迁移</th>
               </tr>
             </thead>
             <tbody id="container-body">
-              <tr><td colspan="6" class="empty">暂无数据</td></tr>
+              <tr><td colspan="7" class="empty">暂无数据</td></tr>
             </tbody>
           </table>
         </div>

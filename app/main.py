@@ -13,7 +13,12 @@ from fastapi.staticfiles import StaticFiles
 
 from . import service
 from .db import Database
-from .schemas import ResolveRequest, TopologyIn
+from .schemas import (
+    RequestCompleteIn,
+    RequestIn,
+    ResolveRequest,
+    TopologyIn,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = BASE_DIR.parent
@@ -160,6 +165,16 @@ def create_app(
     @app.get("/api/drains/{drain_id}")
     def get_drain(drain_id: int) -> dict[str, Any]:
         return service.get_drain(database, drain_id)
+
+    @app.post("/api/requests")
+    def submit_request(request: RequestIn) -> dict[str, Any]:
+        return service.submit_request(database, request.service)
+
+    @app.post("/api/requests/{request_id}/complete")
+    def complete_request(
+        request_id: int, request: RequestCompleteIn = Body(default_factory=RequestCompleteIn)
+    ) -> dict[str, Any]:
+        return service.complete_request(database, request_id, request.result)
 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 

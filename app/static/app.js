@@ -25,6 +25,7 @@ const STATE = {
   busy: false,
   lastRefresh: null,
   reasonDrafts: {},
+  requestResultDrafts: {},
   pausedUntil: 0,
 };
 
@@ -36,11 +37,14 @@ const STATUS_LABELS = {
   drained: "已空",
   serving: "服务中",
   starting: "新副本启动中",
+  awaiting_cutover: "待切换",
   completed: "已完成",
   failed: "启动失败",
   blocked: "受阻",
   active: "进行中",
   incomplete: "未完成",
+  running: "处理中",
+  rejected: "已拒绝",
 };
 
 const REASON_LABELS = {
@@ -48,6 +52,11 @@ const REASON_LABELS = {
   NO_USABLE_TARGET: "没有可用目标节点",
   REPLICA_START_FAILED: "新副本模拟启动失败",
   RESERVATION_LOST: "目标容量预留失效",
+  NO_REPLICA: "业务没有可接单的在服副本",
+  SERVICE_DRAINING: "节点排空中的旧副本不接新请求",
+  REPLICA_STARTING: "副本的新副本启动中，暂不接新请求",
+  REPLICA_PARKED: "副本等待请求结束后切换，不接新请求",
+  REPLICA_BUSY: "副本正忙（同时最多一笔）",
 };
 
 function escapeHtml(value) {
@@ -116,6 +125,9 @@ function applyState(data) {
   document.querySelectorAll("[data-reason-for]").forEach((input) => {
     STATE.reasonDrafts[input.dataset.reasonFor] = input.value;
   });
+  document.querySelectorAll("[data-request-result-for]").forEach((input) => {
+    STATE.requestResultDrafts[input.dataset.requestResultFor] = input.value;
+  });
   STATE.data = data;
   STATE.lastRefresh = new Date();
   if (STATE.selectedNode) {
@@ -127,6 +139,12 @@ function applyState(data) {
   );
   Object.keys(STATE.reasonDrafts).forEach((id) => {
     if (!liveIds.has(id)) delete STATE.reasonDrafts[id];
+  });
+  const liveRequests = new Set(
+    (data.requests || []).filter((r) => r.status === "running").map((r) => String(r.id))
+  );
+  Object.keys(STATE.requestResultDrafts).forEach((id) => {
+    if (!liveRequests.has(id)) delete STATE.requestResultDrafts[id];
   });
   render();
   document.querySelectorAll("[data-reason-for]").forEach((input) => {
@@ -176,6 +194,7 @@ function render() {
   renderNodes(data);
   renderServices(data);
   renderDrains(data);
+  renderRequests(data);
   renderBlocked(data);
   renderContainers(data);
   renderHistory(data);
@@ -261,7 +280,7 @@ function renderNodes(data) {
           <div class="node-head">
             <div class="node-title">
               <strong>${escapeHtml(node.name)}</strong>
-              <small>${escapeHtml(node.id)} · ${node.serving_containers} 个副本${inbound ? ` · ${inbound} 个入库预留` : ""}</small>
+              <small>${escapeHtml(node.id)} · ${node.serving_containers} 个副本${inbound ? ` · ${inbound} 个入库预留` : ""}${node.running_requests ? ` · ${node.running_requests} 笔在途请求` : ""}</small>
             </div>
             <div class="node-actions">
               ${statusChip}
@@ -288,17 +307,21 @@ function renderNodes(data) {
 function renderServices(data) {
   const body = $("service-body");
   if (!data.services.length) {
-    body.innerHTML = `<tr><td colspan="4" class="empty-cell">暂无数据</td></tr>`;
+    body.innerHTML = `<tr><td colspan="5" class="empty-cell">暂无数据</td></tr>`;
     return;
   }
   body.innerHTML = data.services
     .map((service) => {
       const healthy = service.healthy;
+      const parked = service.awaiting_cutover_replicas || 0;
+      const running = service.running_requests || 0;
       return `
         <tr>
           <td><b>${escapeHtml(service.name)}</b></td>
           <td>${service.ready} / ${service.min_ready}</td>
           <td>${service.starting_replicas || "—"}</td>
+          <td>${parked ? `<span class="badge reserved">待切换 ${parked}</span>` : "—"}</td>
+          <td>${running ? `<span class="badge starting">在途 ${running}</span>` : "—"}</td>
           <td>${healthy
             ? `<span class="badge ready">满足</span>`
             : `<span class="badge blocked">不足</span>`}</td>
@@ -333,6 +356,10 @@ function migrationCard(data, migration, drain, { allowActions }) {
            <button class="btn small ghost" data-action="resume" data-node-id="${escapeHtml(drain.node_id)}">重试该节点的受阻副本</button>
          </div>`
       : "";
+  const parkedHint =
+    state === "awaiting_cutover"
+      ? `<p class="hint" style="margin:0">新副本已就绪并继续占用目标 CPU；旧副本仍在处理请求，请求结束后才会停止并完成切换。</p>`
+      : "";
   return `
     <div class="migration-card ${escapeHtml(state)}">
       <div class="migration-head">
@@ -350,6 +377,7 @@ function migrationCard(data, migration, drain, { allowActions }) {
         <span>目标：<b>${escapeHtml(targetNode?.name || (migration.target_node_id || "无可行落点"))}</b></span>
         ${reason ? `<span>原因：<b>${escapeHtml(reason)}</b></span>` : ""}
       </div>
+      ${parkedHint}
       ${actionBlock}
       ${retryBlock}
     </div>`;
@@ -378,10 +406,14 @@ function renderDrains(data) {
     .map((drain) => {
       const pct = Math.max(0, Math.min(100, drain.progress_percent));
       const pending = drain.pending_decisions;
+      const parked = drain.awaiting_cutover_migrations || [];
       const attempts = drain.attempts || [];
-      const pendingIds = new Set(pending.map((m) => m.id));
+      const handledIds = new Set([
+        ...pending.map((m) => m.id),
+        ...parked.map((m) => m.id),
+      ]);
       const recent = attempts
-        .filter((m) => !pendingIds.has(m.id))
+        .filter((m) => !handledIds.has(m.id))
         .slice(-6)
         .reverse();
       return `
@@ -394,18 +426,29 @@ function renderDrains(data) {
             <div class="stat"><div class="label">已迁移</div><div class="value">${drain.moved}<small> / ${drain.total}</small></div></div>
             <div class="stat"><div class="label">节点上剩余副本</div><div class="value">${drain.remaining_on_node}</div></div>
             <div class="stat"><div class="label">启动中新副本</div><div class="value">${drain.starting}</div></div>
+            <div class="stat"><div class="label">待切换（请求在途）</div><div class="value">${drain.awaiting_cutover || 0}</div></div>
             <div class="stat"><div class="label">受阻 / 失败</div><div class="value">${drain.blocked + drain.failed}</div></div>
           </div>
           <div class="progress" role="progressbar" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100">
             <div style="width:${pct}%"></div>
           </div>
-          <p class="hint" style="margin:6px 0 0">${pct}% · 未就绪的新副本不计入就绪数，旧副本在切换前仍在服务</p>
+          <p class="hint" style="margin:6px 0 0">${pct}% · 未就绪的新副本不计入就绪数；待切换期间旧副本继续服务，排空进度不提前变化</p>
           ${
             pending.length
               ? `<div class="migration-list">${pending
                   .map((m) => migrationCard(data, m, drain, { allowActions: true }))
                   .join("")}</div>`
               : `<p class="empty">没有等待决策的新副本。</p>`
+          }
+          ${
+            parked.length
+              ? `<div class="migration-list parked-list">
+                   <p class="hint" style="margin:0">待切换：新副本已就绪并预留目标 CPU，等旧副本的在途请求结束后自动切换（每笔只切换一次）。</p>
+                   ${parked
+                     .map((m) => migrationCard(data, m, drain, { allowActions: false }))
+                     .join("")}
+                 </div>`
+              : ""
           }
           ${
             drain.status === "incomplete"
@@ -426,6 +469,94 @@ function renderDrains(data) {
         </div>`;
     })
     .join("");
+}
+
+function requestReasonLabel(note) {
+  if (!note) return "";
+  const code = note.split(":")[0];
+  return REASON_LABELS[code] || note;
+}
+
+function renderRequests(data) {
+  const select = $("request-service");
+  const hint = $("request-hint");
+  const body = $("request-body");
+
+  // Preserve the current selection across re-renders.
+  const previous = select.value;
+  const serviceNames = data.services.map((s) => s.name);
+  select.innerHTML = serviceNames.length
+    ? serviceNames
+        .map((name) => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`)
+        .join("")
+    : `<option value="">（无业务）</option>`;
+  if (previous && serviceNames.includes(previous)) select.value = previous;
+  select.disabled = !serviceNames.length || STATE.busy;
+  $("request-submit").disabled = !serviceNames.length || STATE.busy;
+
+  const requests = data.requests || [];
+  const running = requests.filter((r) => r.status === "running");
+  hint.textContent = data.running_request_count
+    ? `${data.running_request_count} 笔在途，旧副本不会在请求结束前停止`
+    : "选择业务后发起，系统挑一个可接单的在服副本承接";
+
+  if (!requests.length) {
+    body.innerHTML = `<p class="empty">尚未发起模拟请求。</p>`;
+    return;
+  }
+
+  body.innerHTML = `
+    <div class="request-list">
+      ${requests
+        .map((req) => {
+          const node = data.nodes.find((n) => n.id === req.node_id);
+          const container = data.containers.find((c) => c.id === req.container_id);
+          if (req.status === "rejected") {
+            return `
+              <div class="request-card rejected">
+                <div class="request-head">
+                  <div><b>请求 #${req.id} · ${escapeHtml(req.service)}</b> ${statusBadge("rejected")}</div>
+                  <span class="hint">${escapeHtml(req.created_at)}</span>
+                </div>
+                <div class="kv"><span>拒绝原因：<b>${escapeHtml(requestReasonLabel(req.note))}</b></span></div>
+              </div>`;
+          }
+          const parked = container?.migration?.state === "awaiting_cutover";
+          const completeAction = req.status === "running"
+            ? `<div class="migration-actions">
+                 <input type="text" maxlength="200" placeholder="可填写完成结果（可选）" data-request-result-for="${req.id}" />
+                 <button class="btn small ok" data-action="complete-request" data-request="${req.id}">
+                   ${parked ? "结束请求并完成切换" : "结束请求"}
+                 </button>
+               </div>`
+            : "";
+          return `
+            <div class="request-card ${escapeHtml(req.status)}">
+              <div class="request-head">
+                <div>
+                  <b>请求 #${req.id} · ${escapeHtml(req.service)}</b>
+                  ${statusBadge(req.status)}
+                  ${parked ? `<span class="badge reserved">待切换</span>` : ""}
+                </div>
+                <span class="hint">${escapeHtml(req.created_at)}</span>
+              </div>
+              <div class="kv">
+                <span>承接副本：<b>${escapeHtml(container?.name || req.container_id || "—")}</b></span>
+                <span>节点：<b>${escapeHtml(node?.name || req.node_id || "—")}</b></span>
+                ${parked ? `<span>新副本已就绪，保留目标 CPU，等请求结束后切换</span>` : ""}
+                ${req.cutover_migration_id ? `<span>触发切换 #${req.cutover_migration_id}</span>` : ""}
+                ${req.result ? `<span>结果：<b>${escapeHtml(req.result)}</b></span>` : ""}
+              </div>
+              ${completeAction}
+            </div>`;
+        })
+        .join("")}
+    </div>`;
+
+  document.querySelectorAll("[data-request-result-for]").forEach((input) => {
+    const draft = STATE.requestResultDrafts?.[input.dataset.requestResultFor];
+    if (draft && !input.value) input.value = draft;
+  });
 }
 
 function renderBlocked(data) {
@@ -463,7 +594,7 @@ function renderContainers(data) {
   const body = $("container-body");
   $("container-count").textContent = `${data.containers.length} / 8`;
   if (!data.containers.length) {
-    body.innerHTML = `<tr><td colspan="6" class="empty-cell">暂无数据</td></tr>`;
+    body.innerHTML = `<tr><td colspan="7" class="empty-cell">暂无数据</td></tr>`;
     return;
   }
   body.innerHTML = data.containers
@@ -472,7 +603,11 @@ function renderContainers(data) {
       let migrationCell = "—";
       if (container.migration) {
         const target = data.nodes.find((n) => n.id === container.migration.target_node_id);
-        migrationCell = `<span class="badge starting">启动中 → ${escapeHtml(target?.name || container.migration.target_node_id || "?")}</span>`;
+        const targetName = target?.name || container.migration.target_node_id || "?";
+        migrationCell =
+          container.migration.state === "awaiting_cutover"
+            ? `<span class="badge reserved" title="新副本已就绪，等在途请求结束后切换">待切换 → ${escapeHtml(targetName)}</span>`
+            : `<span class="badge starting">启动中 → ${escapeHtml(targetName)}</span>`;
       } else if (container.blocked_attempt) {
         const reason =
           REASON_LABELS[container.blocked_attempt.error_code] ||
@@ -481,6 +616,11 @@ function renderContainers(data) {
           container.blocked_attempt.error || ""
         )}">${escapeHtml(reason)}</span>`;
       }
+      const requestCell = container.active_request
+        ? `<span class="badge starting" title="请求 #${container.active_request.id} 处理中">处理中 #${container.active_request.id}</span>`
+        : container.accepting_requests
+          ? `<span class="badge ready">可接单</span>`
+          : `<span class="hint">不接单</span>`;
       return `
         <tr>
           <td><b>${escapeHtml(container.name)}</b><br><span class="hint">${escapeHtml(container.id)}</span></td>
@@ -488,6 +628,7 @@ function renderContainers(data) {
           <td>${container.cpu_request}</td>
           <td>${escapeHtml(node?.name || container.node_id)}</td>
           <td>${statusBadge(container.status)}</td>
+          <td>${requestCell}</td>
           <td>${migrationCell}</td>
         </tr>`;
     })
@@ -682,9 +823,64 @@ function wireActions() {
         reason,
       });
       if (data) {
-        toast(outcome === "ready" ? "新副本已就绪，旧副本已停止" : "已模拟启动失败，旧副本继续服务", "ok");
+        if (outcome === "ready") {
+          const attempt = data.open_drains
+            .flatMap((d) => d.attempts || [])
+            .find((m) => String(m.id) === String(id));
+          toast(
+            attempt?.state === "awaiting_cutover"
+              ? "新副本已就绪：旧副本仍在处理请求，进入待切换"
+              : "新副本已就绪，旧副本已停止",
+            "ok"
+          );
+        } else {
+          toast("已模拟启动失败，预留已释放，旧副本继续服务", "ok");
+        }
       }
       return;
+    }
+
+    if (action === "complete-request") {
+      const id = button.dataset.request;
+      const resultInput = document.querySelector(`[data-request-result-for="${id}"]`);
+      const result = (resultInput?.value || "").trim() || null;
+      const before = STATE.data;
+      const request = before.requests.find((r) => String(r.id) === String(id));
+      const container = before.containers.find((c) => c.id === request?.container_id);
+      const willCutOver = container?.migration?.state === "awaiting_cutover";
+      const data = await mutate(`/api/requests/${id}/complete`, { result });
+      if (data) {
+        toast(
+          willCutOver
+            ? "请求已结束，旧副本停止并完成切换（仅切换一次）"
+            : "请求已结束",
+          "ok"
+        );
+      }
+      return;
+    }
+  });
+}
+
+function wireRequests() {
+  $("request-submit").addEventListener("click", async () => {
+    const service = $("request-service").value;
+    if (!service) {
+      toast("请先导入包含业务的拓扑", "error");
+      return;
+    }
+    const data = await mutate("/api/requests", { service });
+    if (!data) return;
+    const latest = data.requests[0];
+    if (latest && latest.status === "rejected") {
+      toast(`请求被明确拒绝：${requestReasonLabel(latest.note)}`, "error");
+    } else if (latest) {
+      const node = data.nodes.find((n) => n.id === latest.node_id);
+      const container = data.containers.find((c) => c.id === latest.container_id);
+      toast(
+        `请求 #${latest.id} 已由副本 ${container?.name || latest.container_id}（${node?.name || latest.node_id}）承接`,
+        "ok"
+      );
     }
   });
 }
@@ -716,6 +912,7 @@ async function init() {
   wireFileInput();
   wireActions();
   wireImport();
+  wireRequests();
   await refresh({ silent: false });
   // Pause auto-refresh briefly after any interaction so re-rendering cannot
   // swallow a click that is already in flight.

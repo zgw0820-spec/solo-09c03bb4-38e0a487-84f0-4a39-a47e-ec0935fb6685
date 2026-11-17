@@ -144,3 +144,30 @@ class ResolveRequest(BaseModel):
             return None
         value = value.strip()
         return value or None
+
+
+class RequestIn(BaseModel):
+    """Payload for the dashboard's simulated business request."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    service: str
+
+    @field_validator("service")
+    @classmethod
+    def clean_service(cls, value: str) -> str:
+        return _clean_label(value, "业务名称")
+
+
+class RequestCompleteIn(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    result: str | None = Field(default=None, max_length=500)
+
+    @field_validator("result")
+    @classmethod
+    def clean_result(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
